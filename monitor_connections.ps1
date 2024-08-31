@@ -1,8 +1,31 @@
+Import-Module NLog
+
+$logConfig = @"
+<nlog>
+  <targets>
+    <target xsi:type="File" name="logfile" fileName="${basedir}/connection_monitor.log" 
+            archiveEvery="Size" maxArchiveFiles="5" 
+            archiveNumbering="Date" 
+            layout="${longdate}|${level}|${message}" />
+  </targets>
+  <rules>
+    <logger name="*" minlevel="Info" writeTo="logfile" />
+  </rules>
+</nlog>
+"@
+Set-Content -Path 'NLog.config' -Value $logConfig
 
 $config = Get-Content -Path 'config.json' | ConvertFrom-Json
 
-$logFilePath = Join-Path -Path $config.logDirectory -ChildPath 'connection_monitor.log'
-$logger = New-Object -TypeName 'System.IO.StreamWriter' -ArgumentList $logFilePath, $true
+if (-not $config.logDirectory -or -not $config.ipstackApiKey -or -not $config.notificationEmail -or -not $config.smtpServer) {
+    throw "Configurações obrigatórias não estão presentes no arquivo de configuração."
+}
+
+$geoLocationCache = @{}
+$cacheExpirationTime = 3600 # 1 hora
+$scriptVersion = "1.0.0"
+$executionId = [guid]::NewGuid().ToString()
+$hostName = $env:COMPUTERNAME
 
 function Write-Log {
     param (
@@ -12,9 +35,8 @@ function Write-Log {
         [string]$Level = 'Info'
     )
 
-    $logEntry = "{0} | {1} | {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
-    $logger.WriteLine($logEntry)
-    $logger.Flush()
+    $logEntry = "{0} | {1} | {2} | {3} | {4} | {5}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message, $scriptVersion, $hostName, $executionId
+    [NLog.LogManager]::GetCurrentClassLogger().Log($Level, $logEntry)
 }
 
 function Get-GeoLocation {
@@ -23,23 +45,29 @@ function Get-GeoLocation {
         [string]$IPAddress
     )
 
-    $cacheKey = "GeoLocation_$IPAddress"
-    $geoLocation = Get-Cache -Key $cacheKey
-
-    if ($geoLocation) {
-        return $geoLocation
+    $currentTime = Get-Date
+    if ($geoLocationCache.ContainsKey($IPAddress) -and ($currentTime - $geoLocationCache[$IPAddress].Timestamp).TotalSeconds -lt $cacheExpirationTime) {
+        return $geoLocationCache[$IPAddress].Data
     }
 
-    $url = "http://api.ipstack.com/$IPAddress`?access_key=$($config.ipstackApiKey)"
+    $url = "http://api.ipstack.com/$IPAddress?access_key=$($config.ipstackApiKey)"
+    $retryCount = 0
+    $maxRetries = 3
+    $retryDelay = 2 # segundos
 
-    try {
-        $response = Invoke-RestMethod -Uri $url
-        Set-Cache -Key $cacheKey -Value $response
-        return $response
-    } catch {
-        Write-Log -Message "Error obtaining geolocation information for $IPAddress`: $_" -Level Error
-        return $null
+    while ($retryCount -lt $maxRetries) {
+        try {
+            $response = Invoke-RestMethod -Uri $url
+            $geoLocationCache[$IPAddress] = @{ Data = $response; Timestamp = $currentTime }
+            return $response
+        } catch {
+            Write-Log -Message "Error obtaining geolocation information for $IPAddress: $_" -Level Error
+            Start-Sleep -Seconds $retryDelay
+            $retryCount++
+            $retryDelay *= 2 # Atraso exponencial
+        }
     }
+    return $null
 }
 
 function Send-Notification {
@@ -55,6 +83,34 @@ function Send-Notification {
     }
 }
 
+function Monitor-Connection {
+    param (
+        [string]$IPAddress,
+        [int]$Port,
+        [string[]]$AllowedRegions
+    )
+
+    try {
+        $tcpClient = New-Object System.Net.Sockets.TcpClient
+        $tcpClient.Connect($IPAddress, $Port)
+
+        $geoLocation = Get-GeoLocation -IPAddress $IPAddress
+        if ($geoLocation -and $AllowedRegions -contains $geoLocation.country_code) {
+            Write-Log -Message "Connection allowed from $($geoLocation.country_name) for IP address $IPAddress on port $Port"
+        } else {
+            $message = "Connection detected from $($geoLocation.country_name) ($($geoLocation.country_code)) for IP address $IPAddress on port $Port"
+            Send-Notification -Message $message
+            Write-Log -Message $message -Level Warning
+        }
+    } catch {
+        Write-Log -Message "Error monitoring connection for $IPAddress:$Port: $_" -Level Error
+    } finally {
+        if ($tcpClient -and $tcpClient.Connected) {
+            $tcpClient.Close()
+        }
+    }
+}
+
 function Monitor-Connections {
     param (
         [Parameter(Mandatory=$true)]
@@ -62,30 +118,13 @@ function Monitor-Connections {
         [string[]]$AllowedRegions = $config.allowedRegions
     )
 
+    $jobs = @()
     foreach ($connection in $ConnectionsToMonitor.GetEnumerator()) {
         $IPAddress = $connection.Key
         $Port = $connection.Value
-
-        try {
-            $tcpClient = New-Object System.Net.Sockets.TcpClient
-            $tcpClient.Connect($IPAddress, $Port)
-
-            $geoLocation = Get-GeoLocation -IPAddress $IPAddress
-            if ($geoLocation -and $AllowedRegions -contains $geoLocation.country_code) {
-                Write-Log -Message "Connection allowed from $($geoLocation.country_name) for IP address $IPAddress on port $Port"
-            } else {
-                $message = "Connection detected from $($geoLocation.country_name) ($($geoLocation.country_code)) for IP address $IPAddress on port $Port"
-                Send-Notification -Message $message
-                Write-Log -Message $message -Level Warning
-            }
-        } catch {
-            Write-Log -Message "Error monitoring connection for $IPAddress`:$Port`: $_" -Level Error
-        } finally {
-            if ($tcpClient -and $tcpClient.Connected) {
-                $tcpClient.Close()
-            }
-        }
+        $jobs += Start-Job -ScriptBlock { Monitor-Connection -IPAddress $using:IPAddress -Port $using:Port -AllowedRegions $using:AllowedRegions }
     }
+    $jobs | Wait-Job | Receive-Job
 }
 
 $connectionsToMonitor = @{
@@ -96,7 +135,6 @@ $connectionsToMonitor = @{
 
 Monitor-Connections -ConnectionsToMonitor $connectionsToMonitor
 
-# Schedule the script to run every 5 minutes
 $trigger = New-JobTrigger -Daily -At (Get-Date).AddMinutes(5)
 $options = New-ScheduledJobOption -RunElevated
 Register-ScheduledJob -Name 'ConnectionMonitor' -ScriptBlock { Monitor-Connections -ConnectionsToMonitor $connectionsToMonitor } -Trigger $trigger -ScheduledJobOption $options
